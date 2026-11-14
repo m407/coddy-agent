@@ -150,6 +150,12 @@ type Agent struct {
 	// turnHookContext is what UserPromptSubmit hooks handed over for this
 	// turn's system prompt (hooks.go).
 	turnHookContext string
+	// firstPromptContext is one-time session enrichment carried in the
+	// turn-scoped context block instead of the cached system prompt.
+	firstPromptContext []string
+	// turnEndAssistantText is the last non-empty answer produced by this Run.
+	// Unlike a transcript index it remains valid when compaction rewrites history.
+	turnEndAssistantText string
 	// autoCompactSkipLogged records that this turn already logged an
 	// automatic compaction with nothing to fold (compact.go).
 	autoCompactSkipLogged bool
@@ -252,15 +258,27 @@ func (a *Agent) wireWorkspaceTool(env *tools.Env) {
 }
 
 // Run executes the ReAct loop and returns the stop reason.
-func (a *Agent) Run(ctx context.Context, prompt []acp.ContentBlock) (string, error) {
+func (a *Agent) Run(ctx context.Context, prompt []acp.ContentBlock) (turnStop string, turnErr error) {
 	mode := a.state.EffectiveMode()
+	// Hook definitions are re-read for every turn.
+	a.resetHooks()
+	hasTurnEnd := a.hooksFor(mode) != nil && a.hooksFor(mode).HasHandlers(hooks.EventTurnEnd)
+	a.turnEndAssistantText = ""
+	// TurnEnd: the turn is over and the agent waits for the user's next
+	// message - the notification source ("the agent is done"). Registered
+	// early so it fires on every way out of the turn. Without a handler there
+	// is no reason to copy the transcript at either boundary.
+	defer func() {
+		if hasTurnEnd {
+			a.runTurnEndHooks(context.WithoutCancel(ctx), mode, turnStop, a.turnEndAssistantText)
+		}
+	}()
 	// A new user turn starts its account of time spent on usage limits
 	// (limit_wait.go); the built-ins below never touch it.
 	a.limitLedger = &limitWaitLedger{}
-	// Hook definitions are re-read for every turn.
-	a.resetHooks()
 	a.hookStopReason = ""
 	a.turnHookContext = ""
+	a.firstPromptContext = nil
 
 	// Build the user message from prompt content blocks.
 	userText := contentBlocksToText(prompt)
@@ -452,18 +470,19 @@ func (a *Agent) Run(ctx context.Context, prompt []acp.ContentBlock) (string, err
 		PersistPlanDocument: func(doc plans.Document) {
 			a.state.AppendPlanDocument(doc)
 		},
-		SSHConnectTimeout: a.cfg.Tools.SSHConnectTimeout,
-		LoadSkillBody:     a.loadSkillBody,
-		ConfigPath:        a.cfg.Paths.ConfigPath,
-		ConfigHome:        a.cfg.Paths.Home,
-		ConfigCWD:         a.cfg.Paths.CWD,
-		OutputLineLimits:  a.cfg.Tools.OutputLimits.AsMap(),
-		Background:        a.backgroundPool(sd),
-		BackgroundEnabled: a.cfg.Tools.Background.ResolvedEnabled(),
-		WebSearch:         webSearchSettings(a.cfg),
-		PreviewServer:     previewServerSettings(a.cfg),
-		AttachImage:       a.attachToolImage,
-		ImageRefusal:      a.toolImageRefusal,
+		SSHConnectTimeout:  a.cfg.Tools.SSHConnectTimeout,
+		LoadSkillBody:      a.loadSkillBody,
+		ConfigPath:         a.cfg.Paths.ConfigPath,
+		ConfigHome:         a.cfg.Paths.Home,
+		ConfigCWD:          a.cfg.Paths.CWD,
+		OutputLineLimits:   a.cfg.Tools.OutputLimits.AsMap(),
+		Background:         a.backgroundPool(sd),
+		BackgroundEnabled:  a.cfg.Tools.Background.ResolvedEnabled(),
+		WebSearch:          webSearchSettings(a.cfg),
+		PreviewServer:      previewServerSettings(a.cfg),
+		CanvasProjectTrust: a.cfg.Tools.Canvas.ResolvedProjectTrust(),
+		AttachImage:        a.attachToolImage,
+		ImageRefusal:       a.toolImageRefusal,
 	}
 	httpRequestEnv(toolEnv, a.cfg)
 	a.wireWorkspaceTool(toolEnv)
@@ -663,7 +682,7 @@ func (a *Agent) keepInterruptedAnswer(model, text, reasoning string, clockStart,
 		}
 		reasoningMs = max(end.Sub(clockStart), 0).Milliseconds()
 	}
-	a.state.AddMessage(llm.Message{
+	a.addAssistantMessage(llm.Message{
 		Role:                llm.RoleAssistant,
 		Content:             text,
 		Reasoning:           reasonTrim,
@@ -843,6 +862,30 @@ func (a *Agent) runReActLoop(
 	activeSkills []*skills.Skill,
 	maxTurns int,
 ) (string, error) {
+	// What the last provider answer of this turn reported about its own cost,
+	// which is what says whether a side call over the same context would be
+	// read back from the provider's cache (session.PromptSuggestionUsage).
+	var lastUsage session.PromptSuggestionUsage
+	defer func() {
+		st, ok := a.state.(interface {
+			SetPromptSuggestionFork(session.PromptSuggestionFork)
+		})
+		if !ok || !a.cfg.Agent.EffectivePromptSuggestions() {
+			return
+		}
+		// The turn's own messages, tools and provider input: the side call
+		// repeats this request with one message appended, so it reads the
+		// prompt cache the turn wrote instead of paying for the history
+		// again. The turn-context block is left out - it is request-only
+		// and sits past the cache mark, so it costs its tokens on every
+		// side call and tells a prediction nothing.
+		st.SetPromptSuggestionFork(session.PromptSuggestionFork{
+			Messages: withToolImages(withToolRules(a.prunedForLLM(messages)), a.modelReadsImages(), a.loadToolImage),
+			Tools:    toolDefs,
+			Input:    transport.in,
+			Usage:    lastUsage,
+		})
+	}()
 	var totalInputTokens, totalOutputTokens int
 	allUsageKnown := true
 	statsWritable := true
@@ -1199,6 +1242,12 @@ func (a *Agent) runReActLoop(
 				a.state.GetID(), formatToolPairingIssues(issues))
 		}
 		latency.paired(pairingStart)
+		// What this request puts on the wire, for a later call over the same
+		// conversation to repeat: a compaction asks its summarizer with this
+		// system message, these tools and this provider input, so everything in
+		// front of its instruction is the prefix the provider is about to cache
+		// (compact_cached.go).
+		a.noteTurnSend(transport, sendMessages, toolDefs)
 		// The estimate the provider's incoming input_tokens is anchored to is
 		// taken here, while the breakdown still describes the prompt about to
 		// be sent - anything persisted or refreshed during the call must not
@@ -1531,7 +1580,13 @@ func (a *Agent) runReActLoop(
 			// keeps its partial answer like a user stop: the user already
 			// watched the text stream in, so it must survive in the
 			// transcript next to the honest error below.
-			if (errors.Is(streamErr, context.Canceled) || llm.IsStreamTruncated(streamErr) || llm.IsStreamStalled(streamErr)) && response != nil {
+			if llm.IsToolSchemaLimit(streamErr) && response == nil {
+				// Some adapters report an in-band refusal with no response
+				// object after deltas. The buffers are the same output the
+				// caller already saw, so preserve them independently of the SDK.
+				response = &llm.Response{Content: answerBuf.String(), Reasoning: reasoningBuf.String()}
+			}
+			if (errors.Is(streamErr, context.Canceled) || llm.IsStreamTruncated(streamErr) || llm.IsStreamStalled(streamErr) || llm.IsToolSchemaLimit(streamErr)) && response != nil {
 				reasonTrim := strings.TrimSpace(reasoningBuf.String())
 				hasText := strings.TrimSpace(response.Content) != ""
 				hasTools := len(response.ToolCalls) > 0
@@ -1565,7 +1620,7 @@ func (a *Agent) runReActLoop(
 						AgentTools:           agentToolsKept,
 					}
 					messages = append(messages, assistantMsg)
-					a.state.AddMessage(assistantMsg)
+					a.addAssistantMessage(assistantMsg)
 					if hasTools {
 						// The response never reached the execution loop, so every
 						// announced call is still unstarted. Keep the assistant
@@ -1575,6 +1630,12 @@ func (a *Agent) runReActLoop(
 					}
 					a.refreshConversationContextUsage(true)
 				}
+			}
+			// A schema validation refusal cannot be repaired by replaying the
+			// same request or compacting the conversation. Any partial answer
+			// has been persisted above.
+			if llm.IsToolSchemaLimit(streamErr) {
+				return string(acp.StopReasonRefused), a.toolSchemaLimitError(streamErr, toolDefs)
 			}
 			if errors.Is(streamErr, context.Canceled) {
 				// If output was already streamed, treat as a clean user-stop regardless.
@@ -1657,6 +1718,12 @@ func (a *Agent) runReActLoop(
 			"cached_input_tokens", response.CachedInputTokens,
 			"output_tokens", response.OutputTokens)
 		usageKnown := response.UsageKnown || (!response.UsageIncomplete && (response.InputTokens > 0 || response.OutputTokens > 0))
+		lastUsage = session.PromptSuggestionUsage{
+			InputTokens:       response.InputTokens,
+			CachedInputTokens: response.CachedInputTokens,
+			OutputTokens:      response.OutputTokens,
+			Known:             usageKnown,
+		}
 		if !transport.agent && usageKnown {
 			// An agent's input count measures its own context (its system
 			// prompt, its tools, their results), not this transcript.
@@ -1765,7 +1832,7 @@ func (a *Agent) runReActLoop(
 			AgentTools:           agentTools.stored(),
 		}
 		messages = append(messages, assistantMsg)
-		a.state.AddMessage(assistantMsg)
+		a.addAssistantMessage(assistantMsg)
 		if stored := a.state.GetMessages(); len(stored) > 0 {
 			if markers := session.ArtifactMarkers(stored[len(stored)-1].Artifacts); markers != "" {
 				_ = a.server.SendSessionUpdate(sessionID, acp.MessageChunkUpdate{
@@ -2158,7 +2225,7 @@ func (a *Agent) persistLoopAbortedMessage(
 		CreatedAt:           time.Now().UTC().Format(time.RFC3339),
 		AgentTools:          agentTools,
 	}
-	a.state.AddMessage(msg)
+	a.addAssistantMessage(msg)
 	if len(toolCalls) > 0 {
 		a.recordSkippedToolCalls(nil, toolCalls, toolCallInterruptedResult)
 	}
@@ -2559,6 +2626,36 @@ func (a *Agent) executeToolCall(ctx context.Context, tc llm.ToolCall, env *tools
 	var execErr error
 	started := time.Now()
 
+	if external, ran := a.runToolExecuteHooks(ctx, tc, mode); ran {
+		switch {
+		case external.Stop:
+			a.hookStopReason = stopReasonOr(external.StopReason)
+			result := "the turn was stopped by a hook: " + a.hookStopReason
+			a.finishToolCall(sessionDir, sessionID, tc, result, nil, "cancelled")
+			return result, nil
+		case external.Blocked():
+			result := session.ToolResultHookBlockedPrefix + reasonOr(external.Reason, "blocked by a hook")
+			a.finishToolCall(sessionDir, sessionID, tc, result, nil, "cancelled")
+			return result, nil
+		case external.Handled:
+			if msg := strings.TrimSpace(external.ToolError); msg != "" {
+				execErr = tools.ApplyOutputLimitError(errors.New(msg), tc.Name, env)
+			} else {
+				result = tools.ApplyOutputLimit(external.ToolResult, tc.Name, env)
+			}
+			ranFor = time.Since(started)
+			outcome = ToolOutcomeOK
+			if execErr != nil {
+				outcome = ToolOutcomeError
+			}
+			return a.completeToolCall(ctx, sessionDir, sessionID, tc, hookRes, mode, result, execErr, ranFor)
+		case ctx.Err() != nil:
+			result := session.ToolResultCancelledBeforeRun
+			a.finishToolCall(sessionDir, sessionID, tc, result, nil, "cancelled")
+			return result, nil
+		}
+	}
+
 	// Check if it's an MCP tool (name contains __).
 	if idx := strings.Index(tc.Name, "__"); idx >= 0 {
 		serverName := tc.Name[:idx]
@@ -2572,9 +2669,11 @@ func (a *Agent) executeToolCall(ctx context.Context, tc llm.ToolCall, env *tools
 			execErr = tools.ApplyOutputLimitError(execErr, tc.Name, env)
 		}
 	} else {
-		// A question waits for the person for the whole of its run.
+		// A question waits for the person for the whole of its run. Question
+		// hooks fire only when the local tool will actually ask it.
 		answered := func() {}
 		if tc.Name == "question" {
+			a.runQuestionHooks(ctx, mode, tc)
 			answered = waitingFor(&pendingQuestions)
 			defer answered()
 		}
@@ -2586,7 +2685,13 @@ func (a *Agent) executeToolCall(ctx context.Context, tc llm.ToolCall, env *tools
 	if execErr != nil {
 		outcome = ToolOutcomeError
 	}
+	return a.completeToolCall(ctx, sessionDir, sessionID, tc, hookRes, mode, result, execErr, ranFor)
+}
 
+// completeToolCall closes one tool call: PostToolUse feedback and the
+// PreToolUse context travel with the result, then the outcome is persisted and
+// announced. Shared by a local run and a ToolExecute handler's external run.
+func (a *Agent) completeToolCall(ctx context.Context, sessionDir, sessionID string, tc llm.ToolCall, hookRes preToolUseOutcome, mode string, result string, execErr error, ranFor time.Duration) (string, error) {
 	// PostToolUse (or PostToolUseFailure) feedback and the PreToolUse
 	// context travel with the result, so the model reads them next to the
 	// output they refer to.
@@ -2894,7 +2999,29 @@ func (a *Agent) buildMessages(systemPrompt string) []llm.Message {
 	// replayed exactly as it was stored: what a /skill or an @mention brought
 	// was written into it when it was sent (mentions.go), so no request
 	// rewrites an earlier message and the provider's cached prefix holds.
-	history := session.MessagesForLLM(a.state.GetMessages())
+	filtered := llmHistoryMessages(session.MessagesForLLM(a.state.GetMessages()))
+	repaired, _ := session.RepairMissingToolResults(filtered)
+	if a.log != nil {
+		if issues := session.ValidateToolPairing(repaired); len(issues) > 0 {
+			a.log.Warn("unrepairable tool-call pairing in LLM history",
+				"session", a.state.GetID(), "issues", issues)
+		} else if len(repaired) != len(filtered) {
+			a.log.Info("repaired missing tool results in LLM history",
+				"session", a.state.GetID(), "inserted", len(repaired)-len(filtered))
+		}
+	}
+	msgs := make([]llm.Message, 0, len(repaired)+1)
+	msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: systemPrompt})
+	msgs = append(msgs, repaired...)
+	return msgs
+}
+
+// llmHistoryMessages is the window of a session as the model reads it back:
+// the UI-only rows dropped, the assistant text stripped the way a continued
+// answer needs it, and the two messages a recovery left in a row folded into
+// one. A compaction builds the same list when it repeats the turn's own
+// request (compact_cached.go), so both agree on the bytes the provider cached.
+func llmHistoryMessages(history []llm.Message) []llm.Message {
 	// UI-only rows (a bare plan document between a call and its result) must be
 	// out of the analysis: they would cut a batch's contiguous result chain and
 	// make a healthy pair look misplaced.
@@ -2924,21 +3051,7 @@ func (a *Agent) buildMessages(systemPrompt string) []llm.Message {
 	}
 	// What the recoveries left as two assistant messages in a row goes out as one,
 	// the same way each time (foldSplitAnswers).
-	filtered = foldSplitAnswers(filtered)
-	repaired, _ := session.RepairMissingToolResults(filtered)
-	if a.log != nil {
-		if issues := session.ValidateToolPairing(repaired); len(issues) > 0 {
-			a.log.Warn("unrepairable tool-call pairing in LLM history",
-				"session", a.state.GetID(), "issues", issues)
-		} else if len(repaired) != len(filtered) {
-			a.log.Info("repaired missing tool results in LLM history",
-				"session", a.state.GetID(), "inserted", len(repaired)-len(filtered))
-		}
-	}
-	msgs := make([]llm.Message, 0, len(repaired)+1)
-	msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: systemPrompt})
-	msgs = append(msgs, repaired...)
-	return msgs
+	return foldSplitAnswers(filtered)
 }
 
 func formatToolPairingIssues(issues []session.ToolPairingIssue) string {
@@ -3134,6 +3247,11 @@ type llmTransport struct {
 	// first-token timer, whose budget the agent's start, handshake and the
 	// replay of a history into a new session would spend.
 	agent bool
+	// in is the input this transport's provider was built from, reasoning
+	// level included. A side call over the same context (the prompt
+	// suggestion) reuses it, so its request differs from the turn's in
+	// nothing the provider's prompt cache keys on.
+	in llm.ProviderInput
 }
 
 // getProvider creates the LLM provider for the given mode.
@@ -3168,6 +3286,7 @@ func (a *Agent) getProvider(mode string) (llmTransport, error) {
 		key:       modelID + "|" + reasoning + "|" + in.ServiceTier,
 		rev:       rev,
 		agent:     rm.ProviderType == "acp",
+		in:        in,
 	}, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -70,6 +71,15 @@ func (s *Server) handleDirectResponses(w http.ResponseWriter, r *http.Request, r
 	opts, err := s.responsesGenerationOptions(s.directCapabilityConfig(r.Context(), cfg, req.Model), req.Model, &req)
 	if err != nil {
 		writeOpenAIValidationError(w, err.Error(), responsesOptionParam(err))
+		return
+	}
+	if req.MaxOutputTokens != nil {
+		if ignored := directIgnoredOutputCap(cfg, req.Model, "max_output_tokens"); ignored != "" {
+			w.Header().Set(coddyIgnoredParamsHeader, ignored)
+		}
+	}
+	if len(req.InlineFiles) > 0 && !configuredModelMultimodal(cfg, req.Model) {
+		writeOpenAIValidationError(w, fmt.Sprintf("%s takes no images: inline_files need a model configured multimodal", req.Model), "inline_files")
 		return
 	}
 	if req.Instructions != nil && *req.Instructions != "" {

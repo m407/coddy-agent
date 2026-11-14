@@ -8,7 +8,7 @@ import (
 )
 
 // UISchemaJSON returns a JSON Schema (draft 2020-12) document for ConfigJSON (UI editor).
-// HTTPServer is omitted; listen bind is controlled via CLI, not this form.
+// The HTTP section exposes account settings, not listener or bearer controls.
 func UISchemaJSON() ([]byte, error) {
 	return UISchemaJSONHiding()
 }
@@ -306,7 +306,7 @@ func UISchemaMap() map[string]interface{} {
 		// form seeds new rows from schema defaults and renders an unset switch
 		// from them.
 		"usage_limits_panel": boolPropDefault("Usage limits panel",
-			"Show the account usage of this NeuralDeep, Codex or Devin provider here, in the console footer and in /usage, reading its usage endpoint for it. Off hides the panel and stops those reads for this row.",
+			"Show the account usage of this NeuralDeep, Codex, Devin or OpenAI-compatible provider here, in the console footer and in /usage, reading its usage endpoint (GET {api_base}/limits for OpenAI-compatible rows). Off hides the panel and stops those reads for this row.",
 			true),
 		"acp": acpProviderSchema(),
 	}
@@ -547,6 +547,8 @@ func UISchemaMap() map[string]interface{} {
 					"Identical back-to-back output cycles inside one streamed response before it is cut (0 disables the check)."),
 				"loop_nudge_max": intProp("Loop nudge max",
 					"How many times one turn may be nudged back on track before the loop guard stops it."),
+				"prompt_suggestions": boolPropDefault("Prompt suggestions",
+					"Suggest the next prompt in the empty composer after a turn. Uses an extra model call; Tab or Right accepts the suggestion. Turn off to stop generating suggestions.", true),
 				"wait_for_limit_reset": boolProp("Wait for limit reset",
 					"Wait for a hit usage limit to lift and re-issue the call instead of ending the turn with the provider's error; the turn and the client stream stay open meanwhile."),
 				"wait_for_limit_reset_max_ms": intProp("Wait for limit reset max ms",
@@ -555,7 +557,7 @@ func UISchemaMap() map[string]interface{} {
 			[]string{
 				"model", "queue_mode", "max_turns", "llm_retry_max", "llm_retry_base_ms", "llm_min_interval_ms",
 				"llm_first_token_timeout_ms", "llm_stream_idle_timeout_ms", "loop_guard", "loop_tool_repeat_limit", "loop_stream_repeat_cycles", "loop_nudge_max",
-				"wait_for_limit_reset", "wait_for_limit_reset_max_ms",
+				"prompt_suggestions", "wait_for_limit_reset", "wait_for_limit_reset_max_ms",
 			},
 			nil),
 		"tools": objectSchema("Tools and permissions", "Filesystem and shell policy for built-in tools.",
@@ -628,8 +630,14 @@ func UISchemaMap() map[string]interface{} {
 							"description": "Further hosts a frame may load from and connect to: https://host or https://*.host. A page on the canvas can send what it reads to any of them.",
 							"items":       map[string]interface{}{"type": "string"},
 						},
+						"project_trust": map[string]interface{}{
+							"type":        "string",
+							"title":       "Pages of a checkout's board",
+							"description": "A .canvas file travels with the checkout, and its pages read every file under their root. \"ask\": run the pages Coddy put on a board and hold the rest until the person trusts the board. \"allow\": run every page. \"deny\": run only the pages Coddy put.",
+							"enum":        []string{ProjectTrustAsk, ProjectTrustAllow, ProjectTrustDeny},
+						},
 					},
-					[]string{"enable", "allow_cdn", "allowed_sources"},
+					[]string{"enable", "allow_cdn", "allowed_sources", "project_trust"},
 					nil),
 				"websearch": objectSchema("Web search",
 					"Which search engines the websearch tool asks, in what order their results merge, and what it may spend asking them. Each engine reports its own outcome next to the results, so a backend that was turned away is named rather than counted as \"nothing found\".",
@@ -965,12 +973,22 @@ func UISchemaMap() map[string]interface{} {
 	// process (the logger, the metrics exporter and the browser extension, then prompts and
 	// instructions, which the web UI folds into one System tab). The sessions
 	// key belongs to the Sessions tab.
+	password := strProp("Password", "Set a new sign-in password; leave empty to keep the existing password.")
+	password["writeOnly"] = true
+	props["httpserver"] = objectSchema("Account", "Web sign-in account", map[string]interface{}{
+		"login": objectSchema("Sign-in", "", map[string]interface{}{
+			"enable":            boolProp("Enable sign-in", "Require a web sign-in."),
+			"user":              strProp("User", "The account name."),
+			"password":          password,
+			"session_ttl_hours": intProp("Session duration", "Persistent session duration in hours; defaults to 24. Unchecked remember me still uses a browser-session cookie."),
+		}, []string{"enable", "user", "password", "session_ttl_hours"}, nil),
+	}, []string{"login"}, nil)
 	rootOrder := []string{
 		"providers", "models", "toolsets",
 		"agent", "supervisor", "compaction", "memory", "decisions",
 		"tools", "skills", "subagents", "hooks",
 		"scheduler", "gateways",
-		"logger", "metrics", "browser", "sessions", "prompts", "instructions",
+		"logger", "metrics", "browser", "httpserver", "sessions", "prompts", "instructions",
 	}
 
 	doc := map[string]interface{}{
@@ -999,8 +1017,6 @@ func toIfaceOrder(keys []string) []interface{} {
 // sections of its own. They still round-trip through GET/PUT /coddy/config,
 // so hiding one here never drops it from the saved document.
 //
-//	httpserver - the surface the UI itself is served from; editing it there
-//	             would let the page cut its own connection.
 //	mcp        - project_trust is edited in the MCP servers tab (POST
 //	             /coddy/mcp/project-trust), next to the servers the policy
 //	             governs; idle_timeout_seconds is set in the file and survives
@@ -1015,12 +1031,11 @@ func toIfaceOrder(keys []string) []interface{} {
 //	revision   - not a setting: it names the configuration a GET document was
 //	             read from (ConfigJSON.Revision) and travels back with the PUT.
 var uiHiddenConfigKeys = map[string]struct{}{
-	"httpserver": {},
-	"mcp":        {},
-	"swarm":      {},
-	"rules":      {},
-	"ui":         {},
-	"revision":   {},
+	"mcp":      {},
+	"swarm":    {},
+	"rules":    {},
+	"ui":       {},
+	"revision": {},
 }
 
 // UISchemaCoversConfigJSONFields checks that UI schema properties match ConfigJSON

@@ -462,6 +462,10 @@ func serverRetryDelay(err error) (time.Duration, bool) {
 	if d, ok := parseRetryAfterHeaders(err); ok {
 		return d, true
 	}
+	var raw *httpStatusError
+	if errors.As(err, &raw) && raw.retryAfter > 0 {
+		return raw.retryAfter, true
+	}
 	if d, ok := parseLimitResetDelay(err); ok {
 		return d, true
 	}
@@ -512,7 +516,7 @@ func isRetryableLLMError(err error) bool {
 	// way. Typed statuses already keep it out of the switch below, but an
 	// error that reached this far as text is read for a status by its digits,
 	// and "your messages resulted in 4500 tokens" holds a "500 ".
-	if IsContextOverflow(err) {
+	if IsContextOverflow(err) || IsClientToolLimit(err) || IsToolSchemaLimit(err) {
 		return false
 	}
 	// Ahead of the deadline gate: a dial that ran out of time matches

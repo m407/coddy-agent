@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/EvilFreelancer/coddy-agent/internal/webauth"
 )
 
 // ConfigJSON is the JSON shape for GET/PUT /coddy/config (snake_case keys match YAML).
@@ -172,6 +174,7 @@ type AgentJSON struct {
 	LoopNudgeMax           *int   `json:"loop_nudge_max,omitempty"`
 	WaitForLimitReset      bool   `json:"wait_for_limit_reset,omitempty"`
 	WaitForLimitResetMaxMS *int   `json:"wait_for_limit_reset_max_ms,omitempty"`
+	PromptSuggestions      *bool  `json:"prompt_suggestions,omitempty"`
 }
 
 // PromptsJSON mirrors Prompts for JSON APIs.
@@ -266,6 +269,7 @@ type ToolCanvasJSON struct {
 	Enabled        *bool    `json:"enable,omitempty"`
 	AllowCDN       *bool    `json:"allow_cdn,omitempty"`
 	AllowedSources []string `json:"allowed_sources,omitempty"`
+	ProjectTrust   string   `json:"project_trust,omitempty"`
 }
 
 // ToolOutputLimitsJSON mirrors ToolOutputLimits. Pointer fields keep the
@@ -378,15 +382,52 @@ type HTTPServerJSON struct {
 	Remotes         []HTTPRemoteJSON `json:"remotes,omitempty"`
 }
 
-// HTTPLoginJSON mirrors HTTPLoginConfig. PasswordHash is write-only: reading
-// the config never returns it, and writing the config back without it keeps the
-// hash that is already on disk.
+// HTTPLoginJSON mirrors HTTPLoginConfig. PasswordHash and TOTPSecret are
+// write-only: reading the config never returns them, and writing the config
+// back without them keeps what is already on disk.
 type HTTPLoginJSON struct {
-	Enabled         *bool  `json:"enable,omitempty"`
-	Mode            string `json:"mode,omitempty"`
-	User            string `json:"user,omitempty"`
-	PasswordHash    string `json:"password_hash,omitempty"`
-	SessionTTLHours int    `json:"session_ttl_hours,omitempty"`
+	BackupCodes           *webauth.BackupState `json:"backup_codes,omitempty"`
+	Password              string               `json:"password,omitempty"`
+	TOTPConfigured        bool                 `json:"totp_configured"`
+	BackupCodesConfigured bool                 `json:"backup_codes_configured"`
+	BackupCodesCount      int                  `json:"backup_codes_count"`
+	BackupCodesGeneration string               `json:"backup_codes_generation"`
+	Enabled               *bool                `json:"enable,omitempty"`
+	Mode                  string               `json:"mode,omitempty"`
+	User                  string               `json:"user,omitempty"`
+	PasswordHash          string               `json:"password_hash,omitempty"`
+	TOTPSecret            string               `json:"totp_secret,omitempty"`
+	SessionTTLHours       int                  `json:"session_ttl_hours,omitempty"`
+	SessionTTLHoursSet    bool                 `json:"-"`
+}
+
+func (j HTTPLoginJSON) MarshalJSON() ([]byte, error) {
+	type plain HTTPLoginJSON
+	var ttl *int
+	if j.SessionTTLHoursSet || j.SessionTTLHours != 0 {
+		ttl = &j.SessionTTLHours
+	}
+	return json.Marshal(struct {
+		plain
+		SessionTTLHours *int `json:"session_ttl_hours,omitempty"`
+	}{plain: plain(j), SessionTTLHours: ttl})
+}
+
+func (j *HTTPLoginJSON) UnmarshalJSON(data []byte) error {
+	type plain HTTPLoginJSON
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields struct {
+		SessionTTLHours *int `json:"session_ttl_hours"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	decoded.SessionTTLHoursSet = fields.SessionTTLHours != nil
+	*j = HTTPLoginJSON(decoded)
+	return nil
 }
 
 // HTTPCORSJSON mirrors HTTPCORSConfig.
@@ -557,6 +598,7 @@ func ConfigToJSONDTO(c *Config) *ConfigJSON {
 		LoopNudgeMax:           cloneIntPtr(c.Agent.LoopNudgeMax),
 		WaitForLimitReset:      c.Agent.WaitForLimitReset,
 		WaitForLimitResetMaxMS: cloneIntPtr(c.Agent.WaitForLimitResetMaxMS),
+		PromptSuggestions:      cloneBoolPtr(c.Agent.PromptSuggestions),
 	}
 	out.Supervisor = c.Supervisor.clone()
 	out.Prompts = PromptsJSON{
@@ -604,6 +646,7 @@ func ConfigToJSONDTO(c *Config) *ConfigJSON {
 			Enabled:        cloneBoolPtr(c.Tools.Canvas.Enabled),
 			AllowCDN:       cloneBoolPtr(c.Tools.Canvas.AllowCDN),
 			AllowedSources: append([]string(nil), c.Tools.Canvas.AllowedSources...),
+			ProjectTrust:   c.Tools.Canvas.ProjectTrust,
 		},
 		HTTPRequest: ToolHTTPRequestJSON{
 			Allowlist:      append([]string(nil), c.Tools.HTTPRequest.Allowlist...),
@@ -654,11 +697,17 @@ func ConfigToJSONDTO(c *Config) *ConfigJSON {
 		// AuthToken is intentionally redacted; report only whether one is configured.
 		AuthConfigured: strings.TrimSpace(c.HTTPServer.AuthToken) != "",
 		Login: HTTPLoginJSON{
-			Enabled: cloneBoolPtr(c.HTTPServer.Login.Enabled),
-			Mode:    c.HTTPServer.Login.Mode,
-			User:    c.HTTPServer.Login.User,
-			// PasswordHash is redacted for the same reason the token is.
-			SessionTTLHours: c.HTTPServer.Login.SessionTTLHours,
+			Enabled:               cloneBoolPtr(c.HTTPServer.Login.Enabled),
+			Mode:                  c.HTTPServer.Login.Mode,
+			User:                  c.HTTPServer.Login.User,
+			TOTPConfigured:        c.HTTPServer.Login.HasTOTP(),
+			BackupCodesConfigured: c.HTTPServer.Login.BackupCodes.Generation != "",
+			BackupCodesCount:      len(c.HTTPServer.Login.BackupCodes.Hashes),
+			BackupCodesGeneration: c.HTTPServer.Login.BackupCodes.Generation,
+			// PasswordHash and TOTPSecret are redacted for the same reason
+			// the token is.
+			SessionTTLHours:    c.HTTPServer.Login.SessionTTLHours,
+			SessionTTLHoursSet: c.HTTPServer.Login.SessionTTLHoursSet,
 		},
 		// An account behind a switched-off form is not a configured sign-in:
 		// the HTTP layer overrides this with the live policy anyway, and a
@@ -813,6 +862,7 @@ func JSONDTOToConfig(j *ConfigJSON, paths Paths) *Config {
 		LoopNudgeMax:           cloneIntPtr(j.Agent.LoopNudgeMax),
 		WaitForLimitReset:      j.Agent.WaitForLimitReset,
 		WaitForLimitResetMaxMS: cloneIntPtr(j.Agent.WaitForLimitResetMaxMS),
+		PromptSuggestions:      cloneBoolPtr(j.Agent.PromptSuggestions),
 	}
 	cfg.Supervisor = j.Supervisor.clone()
 	if j.Agent.MaxTurns != nil {
@@ -864,6 +914,7 @@ func JSONDTOToConfig(j *ConfigJSON, paths Paths) *Config {
 			Enabled:        cloneBoolPtr(j.Tools.Canvas.Enabled),
 			AllowCDN:       cloneBoolPtr(j.Tools.Canvas.AllowCDN),
 			AllowedSources: append([]string(nil), j.Tools.Canvas.AllowedSources...),
+			ProjectTrust:   j.Tools.Canvas.ProjectTrust,
 		},
 		HTTPRequest: ToolHTTPRequest{
 			Allowlist:      append([]string(nil), j.Tools.HTTPRequest.Allowlist...),
@@ -913,11 +964,13 @@ func JSONDTOToConfig(j *ConfigJSON, paths Paths) *Config {
 		Port:                     j.HTTPServer.Port,
 		AuthToken:                j.HTTPServer.AuthToken,
 		Login: HTTPLoginConfig{
-			Enabled:         cloneBoolPtr(j.HTTPServer.Login.Enabled),
-			Mode:            j.HTTPServer.Login.Mode,
-			User:            j.HTTPServer.Login.User,
-			PasswordHash:    j.HTTPServer.Login.PasswordHash,
-			SessionTTLHours: j.HTTPServer.Login.SessionTTLHours,
+			Enabled:            cloneBoolPtr(j.HTTPServer.Login.Enabled),
+			Mode:               j.HTTPServer.Login.Mode,
+			User:               j.HTTPServer.Login.User,
+			PasswordHash:       j.HTTPServer.Login.PasswordHash,
+			TOTPSecret:         j.HTTPServer.Login.TOTPSecret,
+			SessionTTLHours:    j.HTTPServer.Login.SessionTTLHours,
+			SessionTTLHoursSet: j.HTTPServer.Login.SessionTTLHoursSet,
 		},
 		PublicDocs:    j.HTTPServer.PublicDocs,
 		AllowInsecure: j.HTTPServer.AllowInsecure,
@@ -1101,6 +1154,13 @@ func ParseConfigJSONPreservingSecrets(data []byte, paths Paths, current *Config)
 		return nil, fmt.Errorf("json: %w", err)
 	}
 	cfg := JSONDTOToConfig(&j, paths)
+	if j.HTTPServer.Login.Password != "" {
+		hash, err := webauth.HashPassword(j.HTTPServer.Login.Password)
+		if err != nil {
+			return nil, fmt.Errorf("hash login password: %w", err)
+		}
+		cfg.HTTPServer.Login.PasswordHash = hash
+	}
 	preserveRedactedSecrets(cfg, current)
 	applyDefaults(cfg)
 	if err := validateSubconfigs(cfg); err != nil {
@@ -1124,6 +1184,13 @@ func preserveRedactedSecrets(next, current *Config) {
 	if strings.TrimSpace(next.HTTPServer.Login.PasswordHash) == "" && strings.TrimSpace(current.HTTPServer.Login.PasswordHash) != "" {
 		next.HTTPServer.Login.PasswordHash = current.HTTPServer.Login.PasswordHash
 	}
+	// The one-time code secret is write-only too, and only the web UI's
+	// Settings, Authentication enrollment turns it off: a settings save that
+	// dropped it would quietly take the second factor away from the account.
+	if strings.TrimSpace(next.HTTPServer.Login.TOTPSecret) == "" && strings.TrimSpace(current.HTTPServer.Login.TOTPSecret) != "" {
+		next.HTTPServer.Login.TOTPSecret = current.HTTPServer.Login.TOTPSecret
+	}
+	next.HTTPServer.Login.BackupCodes = webauth.BackupState{Generation: current.HTTPServer.Login.BackupCodes.Generation, Hashes: append([]string(nil), current.HTTPServer.Login.BackupCodes.Hashes...)}
 	preserveSwarmSecrets(&next.Swarm, &current.Swarm)
 	if strings.TrimSpace(next.Browser.Token) == "" {
 		next.Browser.Token = current.Browser.Token
