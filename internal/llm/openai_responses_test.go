@@ -84,6 +84,39 @@ func TestOpenAIResponsesBlocking(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesBlockingUsagePresence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		usage string
+		known bool
+		input int
+	}{
+		{"missing", "", false, 0},
+		{"null", `,"usage":null`, false, 0},
+		{"partial", `,"usage":{"input_tokens":7}`, false, 7},
+		{"zero", `,"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}`, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"id":"r1","status":"completed","output":[]%s}`, tc.usage)
+			}))
+			defer srv.Close()
+			p, err := NewProvider(ProviderInput{Type: "openai", Model: "test", Protocol: "responses", BaseURL: srv.URL, RetryDisabled: true, DisableStream: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := p.Complete(context.Background(), []Message{{Role: RoleUser, Content: "hi"}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.UsageKnown != tc.known || out.UsageIncomplete == tc.known || out.InputTokens != tc.input || out.OutputTokens != 0 {
+				t.Fatalf("response=%+v, want UsageKnown=%v, input=%d and zero output", out, tc.known, tc.input)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesBlockingContentFilter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -579,6 +579,8 @@ func TestCompactSessionInTurnKeepsFewerStepsThanTheCapWhenTheyDoNotFit(t *testin
 	provider := &compactCannedProvider{t: t, summary: "summary"}
 	ag := inTurnAgent(t, st, config.Compaction{}, provider)
 	ag.cfg.Models[0].MaxContextTokens = window
+	// This test sizes the window for exactly two steps, with no output reserve.
+	ag.cfg.Models[0].MaxTokens = 0
 
 	res, err := ag.CompactSession(context.Background(), CompactOptions{InTurn: true})
 	if err != nil {

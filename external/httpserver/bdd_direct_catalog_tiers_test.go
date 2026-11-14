@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/EvilFreelancer/coddy-agent/internal/config"
 	"github.com/EvilFreelancer/coddy-agent/internal/llm"
@@ -64,7 +63,6 @@ func checkDirectCatalogTier(t *testing.T, tiers []string, requested string, stat
 		}
 		return []llm.ModelEntry{entry}, nil
 	}, nil)
-	mgr.AwaitContextWindows(context.Background(), cfg, []string{"oauth/test"}, time.Second)
 	srv := New(cfg, mgr, slog.Default(), t.TempDir())
 	defer srv.Drain()
 	calls := 0

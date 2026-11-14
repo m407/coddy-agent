@@ -612,10 +612,10 @@ func onlyCompactCommands(rows []llm.Message) bool {
 }
 
 // maybeAutoCompact runs compaction when the estimated context usage reached
-// compaction.threshold_percent of the session's context window (contextWindow:
-// max_context_tokens, the provider's reported window, or the default - the
-// window the web UI ring shows). It is fail-open: any error (including
-// nothing-to-compact right after a previous compaction) leaves the turn
+// compaction.threshold_percent of the session's context window, narrowed to
+// its positive input budget when output or catalog limits leave less room.
+// It is fail-open: any error (including nothing-to-compact right after a
+// previous compaction) leaves the turn
 // running uncompacted. Returns true when history was compacted and the
 // outgoing message slice must be rebuilt.
 func (a *Agent) maybeAutoCompact(ctx context.Context) bool {
@@ -647,7 +647,8 @@ func (a *Agent) maybeAutoCompact(ctx context.Context) bool {
 			used = measured
 		}
 	}
-	if used < min(comp.EffectiveThresholdPercent()*window/100, a.inputBudgetFor(a.state.EffectiveModelID(a.cfg), window)) {
+	limit := a.autoCompactionWindow(window)
+	if used*100 < comp.EffectiveThresholdPercent()*limit {
 		return false
 	}
 	res, err := a.CompactSession(ctx, CompactOptions{})
@@ -689,7 +690,7 @@ func (a *Agent) maybeAutoCompact(ctx context.Context) bool {
 			"compactedMessages", res.CompactedMessages,
 			"keptMessages", res.KeptMessages,
 			"requestTokensAfter", after)
-		if after*100 >= comp.EffectiveThresholdPercent()*window {
+		if after*100 >= comp.EffectiveThresholdPercent()*limit {
 			// The fold could not bring the request under the threshold (what
 			// every request carries besides the conversation, or the latest
 			// step, is too large for the window): the next step would fold
@@ -711,6 +712,16 @@ func (a *Agent) maybeAutoCompact(ctx context.Context) bool {
 		"compactedMessages", res.CompactedMessages,
 		"keptMessages", res.KeptMessages)
 	return true
+}
+
+// autoCompactionWindow leaves the configured percentage's headroom below the
+// input limit too. A zero budget means output consumes the whole window, not
+// that every nonempty request should compact; retain the window's threshold.
+func (a *Agent) autoCompactionWindow(window int) int {
+	if budget := a.inputBudgetFor(a.state.EffectiveModelID(a.cfg), window); budget > 0 {
+		return min(window, budget)
+	}
+	return window
 }
 
 // compactionCandidate is one summarizer of the chain a compaction may use.

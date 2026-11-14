@@ -101,7 +101,7 @@ func TestDirectCapabilityWarmupSkipsExplicitAndNonCodex(t *testing.T) {
 			mgr.SetContextWindowLister(func(context.Context, llm.ProviderInput) ([]llm.ModelEntry, error) { calls.Add(1); return nil, nil }, nil)
 			srv := New(cfg, mgr, slog.Default(), t.TempDir())
 			defer srv.Drain()
-			got := srv.directCapabilityConfig(context.Background(), cfg, "p/gpt-5.5")
+			got := srv.directCapabilityConfig(context.Background(), cfg, "p/gpt-5.5", "xhigh", "")
 			if calls.Load() != 0 {
 				t.Fatal("unnecessary catalog read")
 			}
@@ -135,7 +135,7 @@ func TestDirectCapabilityWarmupBoundsAndCancellation(t *testing.T) {
 			defer cancel()
 			done := make(chan *config.Config, 1)
 			began := time.Now()
-			go func() { done <- srv.directCapabilityConfig(ctx, cfg, "p/gpt-5.5") }()
+			go func() { done <- srv.directCapabilityConfig(ctx, cfg, "p/gpt-5.5", "xhigh", "") }()
 			select {
 			case <-started:
 			case <-time.After(time.Second):

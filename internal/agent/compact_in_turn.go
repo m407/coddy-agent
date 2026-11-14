@@ -266,7 +266,11 @@ type inTurnPlan struct {
 func (a *Agent) planInTurn(opts CompactOptions, msgs []llm.Message, viewOffset int, projected []llm.Message) (*inTurnPlan, error) {
 	comp := &a.cfg.Compaction
 	limit := a.promptShareLimit(opts.LimitTokens)
-	target := inTurnTargetTokens(limit, comp.EffectiveThresholdPercent())
+	targetLimit := limit
+	if !opts.Recovery {
+		targetLimit = a.autoCompactionWindow(limit)
+	}
+	target := inTurnTargetTokens(targetLimit, comp.EffectiveThresholdPercent())
 	if !opts.Recovery {
 		// The trigger counts the provider's tokens and the budget below counts
 		// Coddy's estimate: a provider that counts denser would otherwise see a

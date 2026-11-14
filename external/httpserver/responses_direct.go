@@ -68,7 +68,11 @@ func (s *Server) handleDirectResponses(w http.ResponseWriter, r *http.Request, r
 		writeClientToolError(w, err)
 		return
 	}
-	opts, err := s.responsesGenerationOptions(s.directCapabilityConfig(r.Context(), cfg, req.Model), req.Model, &req)
+	reasoning := ""
+	if req.Reasoning != nil {
+		reasoning = req.Reasoning.Effort
+	}
+	opts, err := s.responsesGenerationOptions(s.directCapabilityConfig(r.Context(), cfg, req.Model, reasoning, req.ServiceTier), req.Model, &req)
 	if err != nil {
 		writeOpenAIValidationError(w, err.Error(), responsesOptionParam(err))
 		return

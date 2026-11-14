@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
+
+	"github.com/tidwall/gjson"
 )
 
 // Fallback is confined to HTTP refusals before a stream is handed to a caller.
@@ -30,16 +33,33 @@ func (t *serviceTierTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	fast := simpleTierObject(raw)
 	var body map[string]json.RawMessage
-	if err = json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("service tier request: %w", err)
+	if !fast {
+		if err = json.Unmarshal(raw, &body); err != nil {
+			return nil, fmt.Errorf("service tier request: %w", err)
+		}
 	}
 	send := func(tier string) (*http.Response, error) {
 		value, _ := json.Marshal(tier)
-		body["service_tier"] = value
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
+		var data []byte
+		if fast {
+			end := bytes.LastIndexByte(raw, '}')
+			data = make([]byte, 0, len(raw)+len(value)+18)
+			data = append(data, raw[:end]...)
+			if len(bytes.TrimSpace(raw[:end])) > 1 {
+				data = append(data, ',')
+			}
+			data = append(data, `"service_tier":`...)
+			data = append(data, value...)
+			data = append(data, raw[end:]...)
+		} else {
+			body["service_tier"] = value
+			var err error
+			data, err = json.Marshal(body)
+			if err != nil {
+				return nil, err
+			}
 		}
 		next := req.Clone(req.Context())
 		next.Body = io.NopCloser(bytes.NewReader(data))
@@ -67,6 +87,37 @@ func (t *serviceTierTransport) RoundTrip(req *http.Request) (*http.Response, err
 		t.notice("The requested service tier is unavailable; retrying with Standard. Your saved selection is unchanged.")
 	}
 	return send("default")
+}
+
+// Fall back to encoding/json for duplicate or escaped keys, whose normalization
+// cannot be reproduced by simply appending a field.
+func simpleTierObject(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '{' || !utf8.Valid(raw) || !json.Valid(raw) {
+		return false
+	}
+	seen := make(map[string]struct{})
+	ok := true
+	gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
+		name := key.Str
+		for _, c := range key.Raw {
+			if c == '\\' || c >= 128 {
+				ok = false
+				return false
+			}
+		}
+		if name == "service_tier" {
+			ok = false
+			return false
+		}
+		if _, exists := seen[name]; exists {
+			ok = false
+			return false
+		}
+		seen[name] = struct{}{}
+		return true
+	})
+	return ok
 }
 
 type tierResponseBody struct {

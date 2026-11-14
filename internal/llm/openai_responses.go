@@ -8,6 +8,7 @@ import (
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/ssestream"
 	"github.com/openai/openai-go/responses"
+	"github.com/tidwall/gjson"
 	"net/http"
 )
 
@@ -24,7 +25,9 @@ func (p *openAIResponsesProvider) Complete(ctx context.Context, m []Message, t [
 	if err != nil {
 		return nil, fmt.Errorf("openai responses: %w", err)
 	}
-	out := &Response{ActualServiceTier: string(response.ServiceTier), InputTokens: int(response.Usage.InputTokens), OutputTokens: int(response.Usage.OutputTokens), CachedInputTokens: int(response.Usage.InputTokensDetails.CachedTokens), ReasoningTokens: int(response.Usage.OutputTokensDetails.ReasoningTokens), UsageKnown: true}
+	usage := gjson.Get(response.RawJSON(), "usage")
+	usageKnown := usage.IsObject() && usage.Get("input_tokens").Type == gjson.Number && usage.Get("output_tokens").Type == gjson.Number
+	out := &Response{ActualServiceTier: string(response.ServiceTier), InputTokens: int(response.Usage.InputTokens), OutputTokens: int(response.Usage.OutputTokens), CachedInputTokens: int(response.Usage.InputTokensDetails.CachedTokens), ReasoningTokens: int(response.Usage.OutputTokensDetails.ReasoningTokens), UsageKnown: usageKnown, UsageIncomplete: !usageKnown}
 	var items []json.RawMessage
 	for _, item := range response.Output {
 		switch item.Type {

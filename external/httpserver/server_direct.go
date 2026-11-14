@@ -285,20 +285,29 @@ func (s *Server) contextWindowFor(cfg *config.Config, modelRef string) int {
 }
 
 // directCapabilityConfig warms only the Codex capability catalog before validation.
-// Explicit reasoning lists need no discovery; other providers keep their existing
-// admission path and must not receive unrelated model-list requests here.
-func (s *Server) directCapabilityConfig(ctx context.Context, cfg *config.Config, model string) *config.Config {
+// Explicit reasoning lists need no discovery for reasoning; tier discovery is independent.
+// Other providers keep their existing admission path.
+func (s *Server) directCapabilityConfig(ctx context.Context, cfg *config.Config, model, reasoning, tier string) *config.Config {
 	if cfg == nil || s.mgr == nil {
 		return cfg
 	}
 	configured := cfg.FindModelEntry(model)
-	if configured != nil && configured.ReasoningLevels == nil && ctx.Err() == nil {
-		if provider := cfg.FindProvider(configured.ProviderName()); provider != nil && provider.Type == "codex" {
-			s.mgr.AwaitContextWindows(ctx, cfg, []string{model}, session.ContextWindowWait)
+	if configured != nil && ctx.Err() == nil {
+		if strings.TrimSpace(reasoning) == "" {
+			reasoning = configured.ReasoningDefault
+		}
+		if tier == "" {
+			tier = configured.ServiceTier
+		}
+		needReasoning := configured.ReasoningLevels == nil && strings.TrimSpace(reasoning) != ""
+		if needReasoning || tier != "" {
+			if provider := cfg.FindProvider(configured.ProviderName()); provider != nil && provider.Type == "codex" {
+				s.mgr.AwaitContextWindows(ctx, cfg, []string{model}, session.ContextWindowWait)
+			}
 		}
 	}
 	entry := s.mgr.ReasoningModel(cfg, model)
-	if entry == nil {
+	if entry == nil || entry == configured {
 		return cfg
 	}
 	copy := *cfg
