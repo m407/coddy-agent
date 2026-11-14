@@ -3,8 +3,9 @@
 // and whether it reads images, by model id, for the providers of models.dev a provider type of Coddy
 // talks to. The table is models.json, built from models.dev
 // (https://models.dev, MIT licence) by `make models-catalog` and embedded into
-// the binary, so nothing is downloaded or read from disk at run time and no
-// network request is needed to resolve a model at run time.
+// the binary, so resolving a model needs no network request or disk read at
+// run time. Its limits fill settings forms and bound model input budgets. The
+// companion prices.json supplies Statistics with list-price estimates.
 package models
 
 import (
